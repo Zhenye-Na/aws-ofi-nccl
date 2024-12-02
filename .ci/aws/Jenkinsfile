@@ -57,7 +57,6 @@ def run_test_orchestrator_once_persistent(run_name, build_tag, os, instance_type
      * Run PortaFiducia/tests/test_orchestrator.py with given command line arguments on an already existing persistent cluster
      */
 
-    def buildNumber = env.BUILD_NUMBER as int
     def cluster_name = get_persistent_cluster_name(build_tag, os, instance_type)
     def region = get_persistent_cluster_region(cluster_name)
     def args = "--os ${os} --instance-type ${instance_type} --instance-count ${instance_count} --region ${region} --cluster-name ${cluster_name} ${addl_args} --perf-metrics-path /tmp/PortaFiducia/outputs --junit-xml /tmp/PortaFiducia/outputs/${cluster_name}-PR${buildNumber}.xml"
@@ -70,7 +69,6 @@ def run_test_orchestrator_once_container(run_name, build_tag, os, container_os, 
      * Run PortaFiducia/tests/test_orchestrator.py with given command line arguments on an already existing persistent cluster on a container with specified OS
      */
 
-    def buildNumber = env.BUILD_NUMBER as int
     def cluster_name = get_persistent_cluster_name(build_tag, os, instance_type)
     def region = get_persistent_cluster_region(cluster_name)
     def args = "--os ${os} --container-os ${container_os} --instance-type ${instance_type} --instance-count ${instance_count} --region ${region} --cluster-name ${cluster_name} ${addl_args} --perf-metrics-path /tmp/PortaFiducia/outputs --junit-xml /tmp/PortaFiducia/outputs/${cluster_name}-PR${buildNumber}-${os}-${container_os}.xml"
