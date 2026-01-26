@@ -4486,6 +4486,8 @@ static nccl_net_ofi_rdma_recv_comm_t *prepare_recv_comm(nccl_net_ofi_rdma_domain
 	ret = nccl_ofi_freelist_init(sizeof(nccl_net_ofi_rdma_req_t), 16, 16,
 				     4 * NCCL_OFI_MAX_REQUESTS,
 				     rdma_fl_req_entry_init, rdma_fl_req_entry_fini,
+				     "Recv Communicator Requests",
+				     true,
 				     &r_comm->nccl_ofi_reqs_fl);
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Could not allocate NCCL OFI requests free list for dev %d",
@@ -4506,6 +4508,8 @@ static nccl_net_ofi_rdma_recv_comm_t *prepare_recv_comm(nccl_net_ofi_rdma_domain
 					8, 8, NCCL_OFI_MAX_REQUESTS, NULL, NULL,
 					freelist_regmr_host_fn,
 					freelist_deregmr_host_fn, domain, 1,
+					"Ctrl Buffer",
+					true,
 					&r_comm->ctrl_buff_fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Call to freelist_init_mr failed: %d", ret);
@@ -4517,6 +4521,8 @@ static nccl_net_ofi_rdma_recv_comm_t *prepare_recv_comm(nccl_net_ofi_rdma_domain
 					8, 8, NCCL_OFI_MAX_REQUESTS, NULL, NULL,
 					freelist_regmr_host_fn,
 					freelist_deregmr_host_fn, domain, NCCL_OFI_DEFAULT_CPU_CACHE_LINE_SIZE,
+					"Flush Buffer",
+					true,
 					&r_comm->flush_buff_fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Call to freelist_init_mr failed for flush buffer: %d", ret);
@@ -5290,9 +5296,10 @@ static int post_rdma_ctrl(nccl_net_ofi_rdma_req_t *req)
 	nccl_net_ofi_scheduler_t *scheduler = domain->scheduler;
 	uint16_t rail_id;
 	size_t ctrl_msg_len = nccl_net_ofi_rdma_ctrl_msg_size();
+	nccl_net_ofi_schedule_t *schedule = NULL;
 
 	if (ep->num_control_rails > 1) {
-		nccl_net_ofi_schedule_t *schedule = scheduler->get_schedule(scheduler, ctrl_msg_len, ep->num_control_rails);
+		schedule = scheduler->get_schedule(scheduler, ctrl_msg_len, ep->num_control_rails);
 
 		if (OFI_UNLIKELY(!(schedule))) {
 			return -EINVAL;
@@ -5300,6 +5307,7 @@ static int post_rdma_ctrl(nccl_net_ofi_rdma_req_t *req)
 			NCCL_OFI_WARN(
 				"Invalid schedule for outgoing control message. Expected one rail, but got "
 				"%zu", schedule->num_xfer_infos);
+			nccl_net_ofi_release_schedule(scheduler, schedule);
 			return -EINVAL;
 		}
 
@@ -5323,6 +5331,10 @@ static int post_rdma_ctrl(nccl_net_ofi_rdma_req_t *req)
 		NCCL_OFI_TRACE_WRITE_CTRL_START(req->dev_id,
 			rail_id,
 			req->comm, req, req->msg_seq_num);
+	}
+
+	if (schedule) {
+		nccl_net_ofi_release_schedule(scheduler, schedule);
 	}
 
 	return rc;
@@ -5840,10 +5852,18 @@ int nccl_net_ofi_rdma_ep_t::init_rx_buffers()
 	nccl_net_ofi_rdma_ep_rail_t *rail;
 	nccl_net_ofi_rdma_domain_t *domain_ptr = this->rdma_endpoint_get_domain();
 
+	/* TODO: the RX buffer code doesn't yet track and free posted RX
+	   buffers/requests before finalizing the freelists. For now, disable
+	   leak detection for the RX freelists. In the future, we will resolve
+	   this properly by tracking and freeing posted RX buffers. */
+	const bool enable_freelist_leak_detection = false;
+
 	/* We maintain this for only connection close messages */
 	ret = nccl_ofi_freelist_init(sizeof(nccl_net_ofi_rdma_req_t),
 				     ofi_nccl_rdma_min_posted_control_buffers(), 16, 0,
 				     rdma_fl_req_entry_init, rdma_fl_req_entry_fini,
+				     "Rx Buffer Requests",
+				     enable_freelist_leak_detection,
 				     &this->rx_buff_reqs_fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Failed to init rx_buff_reqs_fl");
@@ -5854,7 +5874,10 @@ int nccl_net_ofi_rdma_ep_t::init_rx_buffers()
 					ofi_nccl_rdma_min_posted_control_buffers(), 16, 0,
 					NULL, NULL,
 					freelist_regmr_host_fn, freelist_deregmr_host_fn,
-					domain_ptr, 1, &this->ctrl_rx_buff_fl);
+					domain_ptr, 1,
+					"Ctrl Rx Buffer",
+					enable_freelist_leak_detection,
+					&this->ctrl_rx_buff_fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Failed to init ctrl_rx_buff_fl");
 		if (nccl_ofi_freelist_fini(this->rx_buff_reqs_fl))
@@ -5867,7 +5890,10 @@ int nccl_net_ofi_rdma_ep_t::init_rx_buffers()
 						ofi_nccl_rdma_min_posted_eager_buffers(), 16, 0,
 						NULL, NULL,
 						freelist_regmr_host_fn, freelist_deregmr_host_fn,
-						domain_ptr, EAGER_RX_BUFFER_ALIGNMENT, &this->eager_rx_buff_fl);
+						domain_ptr, EAGER_RX_BUFFER_ALIGNMENT,
+						"Eager Rx Buffer",
+						enable_freelist_leak_detection,
+						&this->eager_rx_buff_fl);
 		if (ret != 0) {
 			NCCL_OFI_WARN("Failed to init eager_rx_buff_size");
 			nccl_ofi_freelist_fini(this->ctrl_rx_buff_fl);
@@ -6154,6 +6180,8 @@ int nccl_net_ofi_rdma_ep_t::create_send_comm(nccl_net_ofi_rdma_send_comm_t **s_c
 	ret = nccl_ofi_freelist_init(sizeof(nccl_net_ofi_rdma_req_t), 16, 16,
 				     NCCL_OFI_MAX_SEND_REQUESTS,
 				     rdma_fl_req_entry_init, rdma_fl_req_entry_fini,
+				     "Send Communicator Requests",
+				     true,
 				     &ret_s_comm->nccl_ofi_reqs_fl);
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Could not allocate NCCL OFI request free list for dev %d rail %d",
@@ -7025,10 +7053,10 @@ nccl_net_ofi_rdma_device_t::nccl_net_ofi_rdma_device_t(nccl_net_ofi_plugin_t *pl
                         length = target_length;
 			info_list = new_list;
 		}
-		NCCL_OFI_INFO(NCCL_NET, "Created device with %zu rails (originally found %zu rails)",
+		NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Created device with %zu rails (originally found %zu rails)",
 			      length, original_length);
 	} else {
-		NCCL_OFI_INFO(NCCL_NET, "Created device with %zu rails", length);
+		NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Created device with %zu rails", length);
 	}
 
 	/* Set NIC information */
