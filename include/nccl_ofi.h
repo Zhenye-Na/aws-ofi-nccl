@@ -366,7 +366,7 @@ public:
 
 	/* Lock for concurrency since domains can be shared by
 	 * multiple entities. */
-	pthread_mutex_t device_lock;
+	std::mutex device_lock;
 
 protected:
 	/**
@@ -443,7 +443,7 @@ public:
 	 * depending on the transport; in that case, this will be the domain object
 	 * associated with the "leader NIC".
 	 */
-	virtual ofi_domain_ptr &get_ofi_domain_for_cm() = 0;
+	virtual ofi_domain_ptr *get_ofi_domain_for_cm() = 0;
 
 	/**
 	 * Retrieve the fid_domain object associated with this plugin domain
@@ -541,7 +541,7 @@ public:
 	/* Memory registration key pool */
 	nccl_ofi_idpool_t *mr_rkey_pool = nullptr;
 
-	pthread_mutex_t domain_lock;
+	std::mutex domain_lock;
 
 	/**
 	 * @brief       Erase all ep_table elements matching the provided ep
@@ -735,7 +735,7 @@ public:
 		ref_cnt--;
 	}
 
-	pthread_mutex_t ep_lock;
+	std::mutex ep_lock;
 
 	/*
 	 * Boolean flag indicating whether the endpoint is still valid and usable

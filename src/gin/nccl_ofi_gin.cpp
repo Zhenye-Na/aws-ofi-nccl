@@ -5,6 +5,8 @@
 #include "gin/nccl_ofi_gin.h"
 
 #include "nccl_ofi_assert.h"
+#include "nccl_ofi_gdrcopy.h"
+#include "nccl_ofi_tracepoint.h"
 
 /**
  * The highest value of NSEG is used to flag an ack message
@@ -31,19 +33,6 @@ struct gin_connect_handle {
 	uint64_t write_ack_buff_mr_key[MAX_NUM_RAILS];
 };
 
-nccl_ofi_gin_ctx::nccl_ofi_gin_ctx() : copy_ctx(new nccl_ofi_gdrcopy_ctx())
-{
-	if (copy_ctx->forced_pcie_copy() == false) {
-		throw std::runtime_error(
-			"GDRCopy does not support forced PCIe copy (GDRCopy 2.5+ required)");
-	}
-}
-
-nccl_ofi_gin_ctx::~nccl_ofi_gin_ctx()
-{
-	delete copy_ctx;
-}
-
 static inline void set_write_ack_buff_info(nccl_ofi_gin_resources &resources,
 					   gin_connect_handle &handle)
 {
@@ -59,33 +48,52 @@ static inline void set_write_ack_buff_info(nccl_ofi_gin_resources &resources,
 
 nccl_ofi_gin_comm::nccl_ofi_gin_comm(nccl_ofi_gin_resources &resources_arg, int rank_, int nranks_,
 				     nccl_net_ofi_send_comm_t *s_comm_,
-				     nccl_net_ofi_recv_comm_t *r_comm_,
-				     nccl_ofi_device_copy &copy_ctx_)
+				     nccl_net_ofi_recv_comm_t *r_comm_)
     : resources(resources_arg), resource_releaser { resources }, rank(rank_), nranks(nranks_),
-      ag_comm(s_comm_, r_comm_, rank_, nranks_), copy_ctx(copy_ctx_),
+      dev(s_comm_->base.dev_id), ag_comm(s_comm_, r_comm_, rank_, nranks_),
       metadata_fl(nullptr, &freelist_deleter)
 {
 	auto &ep = resources.get_ep();
 
-	nccl_ofi_freelist_t *metadata_fl_ptr = nullptr;
-	int ret = nccl_ofi_freelist_init_mr(sizeof(nccl_net_ofi_gin_signal_metadata_msg_t), 16, 16,
-					    0, nullptr, nullptr, ep.freelist_regmr_fn,
-					    ep.freelist_deregmr_fn, &ep, 1, "GIN Metadata", true,
-					    &metadata_fl_ptr);
-	if (ret != 0) {
-		throw std::runtime_error("Failed to initialize freelist for GIN metadata");
-	}
+	std::lock_guard scoped_ep_lock(ep.ep_lock);
+
+	nccl_ofi_freelist *metadata_fl_ptr = nullptr;
+	metadata_fl_ptr = new nccl_ofi_freelist(
+		sizeof(nccl_net_ofi_gin_signal_metadata_msg_t), 16, 16, 0, nullptr, nullptr,
+		ep.freelist_regmr_fn, ep.freelist_deregmr_fn, &ep, 1, "GIN Metadata", true);
 
 	metadata_fl.reset(metadata_fl_ptr);
 
-	this->local_comm_id = resources.alloc_comm_id(); /* TODO free */
-	if (OFI_UNLIKELY(this->local_comm_id == FI_KEY_NOTAVAIL)) {
+#if HAVE_NVTX_TRACING
+	if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
+		for (int i = 0; i < NCCL_OFI_N_NVTX_DOMAIN_PER_COMM; ++i) {
+			char name[64];
+			snprintf(name, 64, "aws-ofi-nccl gin_comm %p_%d", this, i);
+			this->nvtx_domain[i] = nvtxDomainCreateA(name);
+		}
+	}
+#endif
+
+	size_t comm_id = resources.alloc_comm_id(); /* TODO free */
+	if (OFI_UNLIKELY(comm_id == FI_KEY_NOTAVAIL)) {
 		NCCL_OFI_WARN("No comm id available");
 		throw std::runtime_error("No comm id available");
 	}
+	this->local_comm_id = comm_id;
 
 	resources.set_comm(local_comm_id, *this);
 	resources.increment_ref_cnt();
+}
+
+nccl_ofi_gin_comm::~nccl_ofi_gin_comm()
+{
+#if HAVE_NVTX_TRACING
+	if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
+		for (int i = 0; i < NCCL_OFI_N_NVTX_DOMAIN_PER_COMM; ++i) {
+			nvtxDomainDestroy(this->nvtx_domain[i]);
+		}
+	}
+#endif
 }
 
 static inline void set_rail_address(nccl_ofi_gin_ep_rail_t &rail, nccl_ofi_addr &out_addr)
@@ -120,8 +128,7 @@ static inline int rail_addr_insert(nccl_ofi_gin_ep_rail_t &rail, const nccl_ofi_
 	return 0;
 }
 
-int nccl_ofi_gin_listen_comm::connect(nccl_ofi_gin_ctx *gin_ctx,
-				      nccl_net_ofi_conn_handle_t *handles[], int nranks, int rank,
+int nccl_ofi_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[], int nranks, int rank,
 				      nccl_ofi_gin_comm **gin_comm_out)
 {
 	int ret = 0;
@@ -166,14 +173,15 @@ int nccl_ofi_gin_listen_comm::connect(nccl_ofi_gin_ctx *gin_ctx,
 		ep->set_gin_resources(resources);
 	}
 
-	nccl_ofi_gin_comm *gin_comm = new nccl_ofi_gin_comm(*resources, rank, nranks, s_comm,
-							    r_comm, gin_ctx->get_device_copy_ctx());
+	nccl_ofi_gin_comm *gin_comm =
+		new nccl_ofi_gin_comm(*resources, rank, nranks, s_comm, r_comm);
 
 	std::vector<gin_connect_handle> all_handles(nranks, gin_connect_handle {});
 	gin_connect_handle &my_gin_handle = all_handles[rank];
 
 	auto &gin_ep = gin_comm->resources.get_ep();
 
+	std::lock_guard scoped_ep_lock(gin_ep.ep_lock);
 	const int num_rails = static_cast<int>(gin_ep.get_num_rails());
 
 	my_gin_handle.comm_id = gin_comm->local_comm_id;
@@ -242,6 +250,8 @@ int nccl_ofi_gin_comm::writedata_ack(nccl_ofi_gin_comm &gin_comm, uint32_t peer_
 		gin_comm, ofi_ep, rail_id, imm_data, rank_comm.address[rail_id],
 		rank_comm.write_ack_buff_addr_offset, rank_comm.write_ack_buff_mr_key[rail_id]);
 
+	NCCL_OFI_TRACE_GIN_ACK_SEND(dev, rail_id, &gin_comm, peer_rank, msg_seq_num);
+
 	int ret = req->post();
 	if (ret == -FI_EAGAIN) {
 		gin_comm.resources.add_pending_req(req);
@@ -263,6 +273,7 @@ int nccl_ofi_gin_comm::regMrSymDmaBuf(nccl_ofi_mr_ckey_ref ckey, void *data_ptr,
 	NCCL_OFI_TRACE(NCCL_NET, "regMrSymDmaBuf ptr %p size %zu type %d flags %lu handle %p",
 		       data_ptr, size, type, mrFlags, mr_handle);
 
+	std::lock_guard scoped_ep_lock(gin_ep.ep_lock);
 	/**
 	 * Local registration with the endpoint
 	 */
@@ -295,8 +306,8 @@ int nccl_ofi_gin_comm::regMrSymDmaBuf(nccl_ofi_mr_ckey_ref ckey, void *data_ptr,
 		/* For CUDA registrations, we also register the memory with
 		   GDRCopy, in case we are asked to do a signal update to this
 		   region. */
-		ret = copy_ctx.register_region(mr_handle->input_address, mr_handle->size,
-					       mr_handle->gdr_handle);
+		ret = get_device_copy().register_region(mr_handle->input_address, mr_handle->size,
+							mr_handle->gdr_handle);
 		if (ret != 0) {
 			NCCL_OFI_WARN("GDRCopy registration failed: %d", ret);
 			delete mr_handle;
@@ -342,7 +353,7 @@ int nccl_ofi_gin_comm::deregMrSym(gin_sym_mr_handle *mr_handle)
 {
 	NCCL_OFI_TRACE(NCCL_NET, "deregMrSym handle %p", mr_handle);
 	if (mr_handle->type == NCCL_PTR_CUDA) {
-		int ret = copy_ctx.deregister_region(mr_handle->gdr_handle);
+		int ret = get_device_copy().deregister_region(mr_handle->gdr_handle);
 		if (ret != 0) {
 			NCCL_OFI_WARN("GDRCopy deregister failed: %d", ret);
 			return ret;
@@ -403,6 +414,7 @@ int nccl_ofi_gin_comm::iputSignal(uint64_t srcOff, gin_sym_mr_handle *srcMhandle
 		return -EBUSY;
 	}
 
+	std::lock_guard scoped_ep_lock(gin_ep.ep_lock);
 	/* Determine how many segments to send */
 	uint16_t nseg = 0;
 	if (signalOp != 0) {
@@ -420,6 +432,13 @@ int nccl_ofi_gin_comm::iputSignal(uint64_t srcOff, gin_sym_mr_handle *srcMhandle
 
 	int ret = 0;
 	std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> write_reqs {};
+	nccl_net_ofi_gin_metadata_send_req_t *send_req = nullptr;
+
+	/* Create umbrella request first for tracing */
+	auto *req = resources.get_req_from_pool<nccl_net_ofi_gin_iputsignal_req_t>(
+		*this, dst_rank, msg_seq_num, write_reqs, nullptr);
+
+	NCCL_OFI_TRACE_GIN_IPUT_SIGNAL_BEGIN(dev, size, this, dst_rank, msg_seq_num, req);
 
 	if (size > 0) {
 		/* Post write-immediate request with user data */
@@ -446,10 +465,12 @@ int nccl_ofi_gin_comm::iputSignal(uint64_t srcOff, gin_sym_mr_handle *srcMhandle
 				gin_ep.get_rail(xfer_info->rail_id).ofi_ep.get(),
 				(void *)((uintptr_t)src + xfer_info->offset), xfer_info->msg_size,
 				desc, data, rank_comm.address[xfer_info->rail_id],
-				dest + xfer_info->offset,
-				dest_remote_mr.mr_key[xfer_info->rail_id]);
+				dest + xfer_info->offset, dest_remote_mr.mr_key[xfer_info->rail_id],
+				this, dev, dst_rank, msg_seq_num);
 
 			write_reqs[wr_it++] = write_req;
+			NCCL_OFI_TRACE_GIN_WRITE_BEGIN(dev, xfer_info->rail_id, xfer_info->msg_size,
+						       this, dst_rank, msg_seq_num, write_req);
 			ret = write_req->post();
 			if (ret == -FI_EAGAIN) {
 				resources.add_pending_req(write_req);
@@ -458,21 +479,25 @@ int nccl_ofi_gin_comm::iputSignal(uint64_t srcOff, gin_sym_mr_handle *srcMhandle
 				NCCL_OFI_WARN("Write failed for seq_num %hu", msg_seq_num);
 				resources.return_req_to_pool(write_req);
 				nccl_net_ofi_release_schedule(scheduler, schedule);
+				resources.return_req_to_pool(req);
 				return ret;
 			}
 		}
 		nccl_net_ofi_release_schedule(scheduler, schedule);
 	}
 
-	nccl_ofi_freelist_elem_t *metadata_elem = nullptr;
-	nccl_net_ofi_gin_metadata_send_req_t *send_req = nullptr;
+	/* Update umbrella request with write_reqs */
+	req->write_reqs = write_reqs;
+
+	nccl_ofi_freelist::fl_entry *metadata_elem = nullptr;
 
 	if (signalOp != 0) {
 		/* Post metadata send with signal information */
 
-		metadata_elem = nccl_ofi_freelist_entry_alloc(metadata_fl.get());
+		metadata_elem = metadata_fl.get()->entry_alloc();
 		if (!metadata_elem) {
 			NCCL_OFI_WARN("Failed to allocate metadata freelist entry");
+			resources.return_req_to_pool(req);
 			return -ENOMEM;
 		}
 
@@ -495,8 +520,11 @@ int nccl_ofi_gin_comm::iputSignal(uint64_t srcOff, gin_sym_mr_handle *srcMhandle
 
 		send_req = resources.get_req_from_pool<nccl_net_ofi_gin_metadata_send_req_t>(
 			gin_ep.get_rail(rail_id).ofi_ep.get(), rail_id, metadata_elem,
-			rank_comm.address[rail_id], metadata_fl.get());
+			rank_comm.address[rail_id], metadata_fl.get(), this, dev, dst_rank,
+			msg_seq_num);
 
+		NCCL_OFI_TRACE_GIN_METADATA_SEND_BEGIN(dev, rail_id, this, dst_rank, msg_seq_num,
+						       send_req);
 		ret = send_req->post();
 		if (ret == -FI_EAGAIN) {
 			resources.add_pending_req(send_req);
@@ -504,12 +532,13 @@ int nccl_ofi_gin_comm::iputSignal(uint64_t srcOff, gin_sym_mr_handle *srcMhandle
 		} else if (OFI_UNLIKELY(ret != 0)) {
 			NCCL_OFI_WARN("Metadata send failed for seq_num %hu", msg_seq_num);
 			resources.return_req_to_pool(send_req);
+			resources.return_req_to_pool(req);
 			return ret;
 		}
 	}
 
-	auto *req = resources.get_req_from_pool<nccl_net_ofi_gin_iputsignal_req_t>(
-		*this, dst_rank, msg_seq_num, write_reqs, send_req);
+	/* Update umbrella request with send_req */
+	req->send_req = send_req;
 
 	rank_comm.active_put_signal[msg_seq_num % NCCL_OFI_MAX_REQUESTS] = true;
 	rank_comm.next_target_seq_num = (rank_comm.next_target_seq_num + 1) & GIN_IMM_SEQ_MASK;
@@ -552,9 +581,9 @@ int nccl_ofi_gin_comm::do_gin_signal(const nccl_net_ofi_gin_signal_metadata_msg_
 	if (mr_handle->type == NCCL_PTR_CUDA) {
 		uint64_t old_value;
 
-		int ret = this->copy_ctx.copy_from_device(*mr_handle->gdr_handle,
-							  metadata.signal_offset, &old_value,
-							  sizeof(old_value));
+		int ret = get_device_copy().copy_from_device(*mr_handle->gdr_handle,
+							     metadata.signal_offset, &old_value,
+							     sizeof(old_value));
 		if (OFI_UNLIKELY(ret != 0)) {
 			NCCL_OFI_WARN("Failed to read current signal value");
 			return -ret;
@@ -564,8 +593,8 @@ int nccl_ofi_gin_comm::do_gin_signal(const nccl_net_ofi_gin_signal_metadata_msg_
 		uint64_t new_value = old_value + add_value;
 
 		/* Write using GDRcopy. */
-		ret = this->copy_ctx.copy_to_device(&new_value, *mr_handle->gdr_handle,
-						    metadata.signal_offset, sizeof(new_value));
+		ret = get_device_copy().copy_to_device(&new_value, *mr_handle->gdr_handle,
+						       metadata.signal_offset, sizeof(new_value));
 		if (OFI_UNLIKELY(ret != 0)) {
 			NCCL_OFI_WARN("Failed to update signal value");
 			return -ret;
@@ -600,16 +629,20 @@ int nccl_ofi_gin_comm::iput_signal_recv_req_completion(uint32_t peer_rank, uint6
 		       req->metadata.msg_seq_num);
 
 	if (req->metadata_received) {
+		NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_BEGIN(dev, this, peer_rank,
+							 req->metadata.msg_seq_num, req);
 		ret = do_gin_signal(req->metadata);
-		if (ret != 0) {
-			return ret;
-		}
-	} else {
-		/* No signal associated with this op (true for iput) */
+		NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END(dev, this, peer_rank,
+						       req->metadata.msg_seq_num, req);
+	}
+
+	if (ret != 0) {
+		return ret;
 	}
 
 	/* Write ack */
 	ret = writedata_ack(*this, peer_rank, req->metadata.msg_seq_num);
+
 	if (ret != 0) {
 		return ret;
 	}
@@ -671,26 +704,24 @@ int nccl_ofi_gin_comm::handle_signal_metadata_completion(
 	uint64_t map_key = get_req_map_key(peer_rank, msg_seq_num);
 
 	auto it = outstanding_iput_signal_recv_reqs.find(map_key);
+	nccl_net_ofi_gin_iputsignal_recv_req *req;
 	if (it == outstanding_iput_signal_recv_reqs.end()) {
-		auto *req = resources.get_req_from_pool<nccl_net_ofi_gin_iputsignal_recv_req>();
+		req = resources.get_req_from_pool<nccl_net_ofi_gin_iputsignal_recv_req>();
 
 		req->num_seg_completions = 1;
 		req->total_segments = metadata_msg->num_segments;
 		req->metadata = *metadata_msg;
 		req->metadata_received = true;
 		outstanding_iput_signal_recv_reqs[map_key] = req;
-
-		ret = iput_signal_deliver_all(peer_rank);
-
 	} else {
-		auto *req = it->second;
+		req = it->second;
 
 		req->metadata = *metadata_msg;
-
 		req->metadata_received = true;
 		req->num_seg_completions += 1;
-		ret = iput_signal_deliver_all(peer_rank);
 	}
+	NCCL_OFI_TRACE_GIN_RECV_METADATA(dev, rail_id, this, peer_rank, msg_seq_num, req);
+	ret = iput_signal_deliver_all(peer_rank);
 
 	return ret;
 }
@@ -704,6 +735,8 @@ int nccl_ofi_gin_comm::handle_signal_write_completion(fi_addr_t src_addr, uint16
 	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
 	if (total_segms == WRITEDATA_ACK_NSEG) {
 		assert(len == 0);
+
+		NCCL_OFI_TRACE_GIN_ACK_RECV(dev, rail_id, this, peer_rank, msg_seq_num);
 
 		auto &rank_comm = rank_comms[peer_rank];
 		assert_always(rank_comm.active_put_signal[msg_seq_num % NCCL_OFI_MAX_REQUESTS] ==
@@ -722,12 +755,12 @@ int nccl_ofi_gin_comm::handle_signal_write_completion(fi_addr_t src_addr, uint16
 		req->num_seg_completions = 1;
 		req->total_segments = total_segms;
 		outstanding_iput_signal_recv_reqs[map_key] = req;
-
 	} else {
 		req = it->second;
 		assert(req->total_segments == total_segms);
 		req->num_seg_completions += 1;
 	}
+	NCCL_OFI_TRACE_GIN_RECV_WRITE(dev, rail_id, len, this, peer_rank, msg_seq_num, req);
 
 	if (req->num_seg_completions == req->total_segments) {
 		/* Fill in the fields related to metadata */

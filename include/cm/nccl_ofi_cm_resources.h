@@ -44,7 +44,7 @@ public:
 
 		ofi_mr_ptr mr;
 		uint64_t mr_key;
-		endpoint &ep;
+		endpoint *ep;
 	};
 
 	/**
@@ -111,8 +111,8 @@ public:
 	static int dereg_mr(void *handle_ptr);
 private:
 	/* Input to CM */
-	ofi_domain_ptr &ofi_domain;
-	nccl_ofi_idpool_t &mr_key_pool;
+	ofi_domain_ptr *ofi_domain;
+	nccl_ofi_idpool_t *mr_key_pool;
 
 	/* Created by CM */
 	ofi_av_ptr av;
@@ -141,17 +141,17 @@ public:
 	/**
 	 * Allocate a registered connect message from the freelist
 	 */
-	nccl_ofi_freelist_elem_t &allocate_conn_msg();
+	nccl_ofi_freelist::fl_entry &allocate_conn_msg();
 
 	/**
 	 * Free a buffer allocated using allocate_conn_msg, returning it to the
 	 * freelist
 	 */
-	void free_conn_msg(nccl_ofi_freelist_elem_t &conn_msg);
+	void free_conn_msg(nccl_ofi_freelist::fl_entry &conn_msg);
 
 private:
 	endpoint &ep;
-	nccl_ofi_freelist_t *buff_fl;
+	nccl_ofi_freelist *buff_fl;
 };
 
 

@@ -105,11 +105,16 @@
  * Get the endpoint lock
  * If parent endpoint exists, return its lock instead because the
  * lock is mainly to protect the CQ which is owned by the parent endpoint
+ *
+ * coerce the type so that the compiler can derive the template parameter for
+ * std::lock_guard
  */
-#define ENDPOINT_LOCK(endpoint) \
-	endpoint->parent_endpoint ? \
-		&endpoint->parent_endpoint->ep_lock : \
-		&endpoint->ep_lock \
+static inline decltype(nccl_net_ofi_rdma_ep_t::ep_lock)& ENDPOINT_LOCK(nccl_net_ofi_rdma_ep_t *endpoint)
+{
+	return (endpoint->parent_endpoint ?
+		endpoint->parent_endpoint->ep_lock :
+		endpoint->ep_lock);
+}
 
 
 /**
@@ -155,24 +160,15 @@ static int post_rx_buffer(nccl_net_ofi_rdma_req_t *req,
 			      nccl_net_ofi_rdma_ep_rail_t *ep_rail,
 			      bool set_fi_more);
 
-static nccl_net_ofi_rdma_req_t *allocate_req(nccl_ofi_freelist_t *fl);
+static nccl_net_ofi_rdma_req_t *allocate_req(nccl_ofi_freelist *fl);
 
 static inline int free_base_req(uint64_t *num_inflight_reqs,
-				nccl_ofi_freelist_t *nccl_ofi_reqs_fl,
+				nccl_ofi_freelist *nccl_ofi_reqs_fl,
 				nccl_net_ofi_rdma_req_t *req,
 				bool dec_inflight_reqs);
 
 static inline int check_post_rx_buff_req(nccl_net_ofi_rdma_req_t *rx_buff_req);
 
-
-/*
- * Get connection message from rx buffer
- */
-static inline nccl_ofi_rdma_connection_info_t *get_rx_connection_msg(
-	rdma_req_rx_buff_data_t *rx_buff_data)
-{
-	return (nccl_ofi_rdma_connection_info_t *)rx_buff_data->rx_buff_fl_elem->ptr;
-}
 
 /*
  * Get close message from rx buffer
@@ -195,16 +191,6 @@ static nccl_net_ofi_rdma_close_msg_t *rdma_send_close_get_msg
 	return (nccl_net_ofi_rdma_close_msg_t *)send_close_data->ctrl_fl_elem->ptr;
 }
 
-/*
- * @brief Return send communicator control rail with index `rail_id`
- */
-static inline nccl_net_ofi_rdma_send_comm_rail_t *rdma_send_comm_get_control_rail(nccl_net_ofi_rdma_send_comm_t *s_comm,
-								uint16_t rail_id)
-{
-	assert(s_comm->control_rails);
-	assert(rail_id < s_comm->num_control_rails);
-	return &s_comm->control_rails[rail_id];
-}
 
 static nccl_net_ofi_rdma_ep_t *rdma_send_comm_get_ep(nccl_net_ofi_rdma_send_comm_t *s_comm)
 {
@@ -1757,12 +1743,12 @@ static inline void zero_nccl_ofi_req(nccl_net_ofi_rdma_req_t *req)
  * @brief	Free request by returning request back into freelist
  */
 static inline int free_base_req(uint64_t *num_inflight_reqs,
-					 nccl_ofi_freelist_t *nccl_ofi_reqs_fl,
+					 nccl_ofi_freelist *nccl_ofi_reqs_fl,
 					 nccl_net_ofi_rdma_req_t *req,
 					 bool dec_inflight_reqs)
 {
 	int ret = 0;
-	nccl_ofi_freelist_elem_t *elem = NULL;
+	nccl_ofi_freelist::fl_entry *elem = NULL;
 	
 	if (OFI_UNLIKELY(req == NULL)) {
 		ret = -EINVAL;
@@ -1782,7 +1768,7 @@ static inline int free_base_req(uint64_t *num_inflight_reqs,
 	/* Zero out buffer */
 	zero_nccl_ofi_req(req);
 
-	nccl_ofi_freelist_entry_free(nccl_ofi_reqs_fl, elem);
+	nccl_ofi_reqs_fl->entry_free(elem);
 
 	/* Reduce inflight commands */
 	if (OFI_LIKELY(dec_inflight_reqs == true) && (num_inflight_reqs != NULL))
@@ -1926,7 +1912,7 @@ static inline int free_send_close_req(nccl_net_ofi_rdma_req_t *req,
 	}
 
 	if (send_close_data->ctrl_fl_elem) {
-		nccl_ofi_freelist_entry_free(r_comm->ctrl_buff_fl, send_close_data->ctrl_fl_elem);
+		r_comm->ctrl_buff_fl->entry_free(send_close_data->ctrl_fl_elem);
 		send_close_data->ctrl_fl_elem = NULL;
 	}
 
@@ -1949,24 +1935,13 @@ static inline int free_flush_req(nccl_net_ofi_rdma_req_t *req,
 
 	// Free flush buffer
 	if (flush_data->flush_fl_elem) {
-		nccl_ofi_freelist_entry_free(r_comm->flush_buff_fl, flush_data->flush_fl_elem);
+		r_comm->flush_buff_fl->entry_free(flush_data->flush_fl_elem);
 		flush_data->flush_fl_elem = NULL;
 	}
 	return free_base_req(&r_comm->num_inflight_reqs, r_comm->nccl_ofi_reqs_fl,
 			req, dec_inflight_reqs);
 }
 
-/*
- * @brief	Dummy free function that shall not be called.
- *
- * @return	non-zero
- */
-static inline int free_invalid(nccl_net_ofi_rdma_req_t *req,
-					bool dec_inflight_reqs)
-{
-	NCCL_OFI_WARN("Failed to free request. Type :%d", req->type);
-	return -EINVAL;
-}
 
 static inline int eager_rx_buff_req_free(nccl_net_ofi_rdma_req_t *req,
 					   bool dec_inflight_reqs)
@@ -1979,7 +1954,7 @@ static inline int eager_rx_buff_req_free(nccl_net_ofi_rdma_req_t *req,
 
 	/* Free buffer */
 	if (rx_buff_data->rx_buff_fl_elem) {
-		nccl_ofi_freelist_entry_free(ep->eager_rx_buff_fl, rx_buff_data->rx_buff_fl_elem);
+		ep->eager_rx_buff_fl->entry_free(rx_buff_data->rx_buff_fl_elem);
 	}
 	return free_base_req(NULL, ep->rx_buff_reqs_fl, req, false);
 }
@@ -1999,8 +1974,8 @@ static inline nccl_net_ofi_rdma_req_t *eager_rx_buff_req_alloc(nccl_net_ofi_rdma
 
 	rdma_req_rx_buff_data_t *rx_buff_data = get_rx_buff_data(req);
 
-	nccl_ofi_freelist_elem_t *rx_buff_fl_elem =
-		nccl_ofi_freelist_entry_alloc(ep->eager_rx_buff_fl);
+	nccl_ofi_freelist::fl_entry *rx_buff_fl_elem =
+		ep->eager_rx_buff_fl->entry_alloc();
 	if (!rx_buff_fl_elem) {
 		NCCL_OFI_WARN("Failed to allocate rx_buff_fl_elem");
 		req->free(req, false);
@@ -2023,7 +1998,7 @@ static inline int ctrl_rx_buff_req_free(nccl_net_ofi_rdma_req_t *req,
 	nccl_net_ofi_rdma_ep_t *ep = rx_buff_data->ep;
 	/* Free buffer */
 	if (rx_buff_data->rx_buff_fl_elem) {
-		nccl_ofi_freelist_entry_free(ep->ctrl_rx_buff_fl, rx_buff_data->rx_buff_fl_elem);
+		ep->ctrl_rx_buff_fl->entry_free(rx_buff_data->rx_buff_fl_elem);
 	}
 	return free_base_req(NULL, ep->rx_buff_reqs_fl, req, false);
 }
@@ -2041,8 +2016,8 @@ static inline nccl_net_ofi_rdma_req_t *ctrl_rx_buff_req_alloc(nccl_net_ofi_rdma_
 
 	rdma_req_rx_buff_data_t *rx_buff_data = get_rx_buff_data(req);
 
-	nccl_ofi_freelist_elem_t *rx_buff_fl_elem =
-		nccl_ofi_freelist_entry_alloc(ep->ctrl_rx_buff_fl);
+	nccl_ofi_freelist::fl_entry *rx_buff_fl_elem =
+		ep->ctrl_rx_buff_fl->entry_alloc();
 	if (!rx_buff_fl_elem) {
 		NCCL_OFI_WARN("Failed to allocate rx_buff_fl_elem");
 		req->free(req, false);
@@ -2310,6 +2285,8 @@ static inline uint64_t* get_flush_buffer_for_rail(void *ptr, uint16_t rail_id){
 	return &(fl_data[rail_id].flag);
 }
 
+
+#if HAVE_GPU
 static inline bool has_flush_completed(nccl_net_ofi_rdma_req_t *req)
 {
 	rdma_req_flush_data_t *flush_data = get_flush_data(req);
@@ -2327,6 +2304,9 @@ static inline bool has_flush_completed(nccl_net_ofi_rdma_req_t *req)
 
 	return true;
 }
+#endif
+
+
 /*
  * @brief Check the contents of the control mailbox to check if the
  * control message has arrived or not
@@ -2379,7 +2359,6 @@ static inline int update_send_request(nccl_net_ofi_rdma_send_comm_t* s_comm, ncc
 	return ret;
 }
 
-#define __compiler_barrier() do { asm volatile ("" : : : "memory"); } while(0)
 
 static int test(nccl_net_ofi_req_t *base_req, int *done, int *size)
 {
@@ -2400,7 +2379,7 @@ static int test(nccl_net_ofi_req_t *base_req, int *done, int *size)
 	nccl_net_ofi_rdma_ep_t *ep = (nccl_net_ofi_rdma_ep_t *)base_comm->ep;
 	assert(ep != NULL);
 
-	pthread_wrapper eplock(ENDPOINT_LOCK(ep));
+	std::lock_guard eplock(ENDPOINT_LOCK(ep));
 
 	CHECK_ENDPOINT_ACTIVE(ep, "test");
 
@@ -2730,7 +2709,7 @@ static int reg_mr_send_comm(nccl_net_ofi_send_comm_t *send_comm,
         nccl_net_ofi_rdma_domain_t *domain = ep->rdma_endpoint_get_domain();
 	assert(domain != NULL);
 
-	pthread_wrapper domain_lock(&domain->domain_lock);
+	std::lock_guard domain_lock(domain->domain_lock);
 
 	return domain->reg_mr(ckey,
 			      type,
@@ -2745,7 +2724,7 @@ static int reg_mr_recv_comm(nccl_net_ofi_recv_comm_t *recv_comm,
 	nccl_net_ofi_rdma_domain_t *domain = ep->rdma_endpoint_get_domain();
 	assert(domain != NULL);
 
-	pthread_wrapper domain_lock(&domain->domain_lock);
+	std::lock_guard domain_lock(domain->domain_lock);
 
 	return domain->reg_mr(ckey,
 			      type,
@@ -2828,11 +2807,11 @@ static int dereg_mr_recv_comm(nccl_net_ofi_recv_comm_t *recv_comm,
 /*
  * @brief	Assign an allocated rdma request buffer
  */
-static inline nccl_net_ofi_rdma_req_t *allocate_req(nccl_ofi_freelist_t *fl)
+static inline nccl_net_ofi_rdma_req_t *allocate_req(nccl_ofi_freelist *fl)
 {
 	assert(fl != NULL);
 
-	nccl_ofi_freelist_elem_t *elem = nccl_ofi_freelist_entry_alloc(fl);
+	nccl_ofi_freelist::fl_entry *elem = fl->entry_alloc();
 	if (OFI_UNLIKELY(elem == NULL)) {
 		NCCL_OFI_WARN("No freelist items available");
 		return NULL;
@@ -3074,7 +3053,7 @@ static int recv(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
 	device = ep->rdma_endpoint_get_device();
 	assert(device != NULL);
 
-	pthread_wrapper eplock(ENDPOINT_LOCK(ep));
+	std::lock_guard eplock(ENDPOINT_LOCK(ep));
 
 	CHECK_ENDPOINT_ACTIVE(ep, "recv");
 
@@ -3437,23 +3416,9 @@ static int recv_comm_destroy(nccl_net_ofi_rdma_recv_comm_t *r_comm)
 	/* Deregister mr for control messages */
 	domain->dereg_mr(r_comm->ctrl_mr_handle);
 
-	ret = nccl_ofi_freelist_fini(r_comm->ctrl_buff_fl);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Call to nccl_ofi_freelist_fini failed: %d", ret);
-		return ret;
-	}
-
-	ret = nccl_ofi_freelist_fini(r_comm->flush_buff_fl);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Call to nccl_ofi_freelist_fini failed: %d", ret);
-		return ret;
-	}
-
-	ret = nccl_ofi_freelist_fini(r_comm->nccl_ofi_reqs_fl);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Call to nccl_ofi_freelist_fini failed: %d", ret);
-		return ret;
-	}
+	delete r_comm->ctrl_buff_fl;
+	delete r_comm->flush_buff_fl;
+	delete r_comm->nccl_ofi_reqs_fl;
 
 	if (!nccl_ofi_msgbuff_destroy(r_comm->msgbuff)) {
 		NCCL_OFI_WARN("Failed to destroy msgbuff (r_comm)");
@@ -3509,8 +3474,7 @@ static inline int recv_comm_insert_send_close_req(nccl_net_ofi_rdma_recv_comm_t 
 	/*
 	 * Set up send close message
 	 */
-	send_close_data->ctrl_fl_elem = nccl_ofi_freelist_entry_alloc
-		(r_comm->ctrl_buff_fl);
+	send_close_data->ctrl_fl_elem = r_comm->ctrl_buff_fl->entry_alloc();
 	if (send_close_data->ctrl_fl_elem == NULL) {
 		NCCL_OFI_WARN("Call to nccl_ofi_freelist_entry_alloc failed");
 		send_close_req->free(send_close_req, false);
@@ -3541,7 +3505,7 @@ static inline int progress_closing_recv_comm(nccl_net_ofi_rdma_recv_comm_t *r_co
 	nccl_net_ofi_rdma_ep_t *ep = (nccl_net_ofi_rdma_ep_t *)
 		r_comm->base.base.ep;
 
-	pthread_wrapper eplock(ENDPOINT_LOCK(ep));
+	std::lock_guard eplock(ENDPOINT_LOCK(ep));
 	if ((ep->parent_endpoint && !ep->parent_endpoint->ep_active) ||
 	    (!ep->ep_active)) {
 		/**
@@ -3681,11 +3645,7 @@ static int send_comm_destroy(nccl_net_ofi_rdma_send_comm_t *s_comm)
 	}
 
 	/* Release request freelist */
-	ret = nccl_ofi_freelist_fini(s_comm->nccl_ofi_reqs_fl);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Call to nccl_ofi_freelist_fini failed: %d", ret);
-		return ret;
-	}
+	delete s_comm->nccl_ofi_reqs_fl;
 
 	nccl_net_ofi_rdma_ep_t *ep = (nccl_net_ofi_rdma_ep_t *) s_comm->base.base.ep;
 	nccl_net_ofi_rdma_device_t *device = ep->rdma_endpoint_get_device();
@@ -3736,7 +3696,7 @@ static inline int progress_closing_send_comm(nccl_net_ofi_rdma_send_comm_t *s_co
 	nccl_net_ofi_rdma_ep_t *ep = (nccl_net_ofi_rdma_ep_t *)
 		s_comm->base.base.ep;
 
-	pthread_wrapper eplock(ENDPOINT_LOCK(ep));
+	std::lock_guard eplock(ENDPOINT_LOCK(ep));
 	if (!ep->ep_active) {
 		/**
 		 * If the endpoint is not active, no need to wait for the
@@ -3850,7 +3810,7 @@ void nccl_net_ofi_rdma_ep_t::rdma_endpoint_abort()
 	nccl_net_ofi_rdma_domain_t *domain_ptr = this->rdma_endpoint_get_domain();
 	int dev_id = domain_ptr->get_device()->dev_id;
 
-	pthread_wrapper eplock(ENDPOINT_LOCK(this));
+	std::lock_guard eplock(ENDPOINT_LOCK(this));
 
 	this->release_rdma_ep_resources(dev_id);
 	if (this->parent_endpoint)
@@ -3929,7 +3889,7 @@ static int rdma_comm_alloc_flush_req(nccl_net_ofi_rdma_recv_comm_t *r_comm,
 	flush_data = get_flush_data(req);
 	flush_data->data = buff;
 	flush_data->mr_handle = buff_mr_handle;
-	flush_data->flush_fl_elem = nccl_ofi_freelist_entry_alloc(r_comm->flush_buff_fl);
+	flush_data->flush_fl_elem = r_comm->flush_buff_fl->entry_alloc();
 	if (OFI_UNLIKELY(flush_data->flush_fl_elem == NULL)) {
 		NCCL_OFI_WARN("Unable to get allocate flush buffer for device %d", dev_id);
 		return -ENOMEM;
@@ -3959,7 +3919,7 @@ static int flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
 		(nccl_net_ofi_rdma_recv_comm_t *)recv_comm;
 	nccl_net_ofi_rdma_ep_t *ep = rdma_recv_comm_get_ep(r_comm);
 
-	pthread_wrapper eplock(ENDPOINT_LOCK(ep));
+	std::lock_guard eplock(ENDPOINT_LOCK(ep));
 
 	CHECK_ENDPOINT_ACTIVE(ep, "flush");
 
@@ -4393,9 +4353,9 @@ static nccl_net_ofi_rdma_recv_comm_t *prepare_recv_comm(nccl_net_ofi_rdma_domain
 			 * refcnt.
 			 */
 
-			nccl_net_ofi_mutex_lock(&device->device_lock);
+			device->device_lock.lock();
 			domain->increment_ref_cnt();
-			nccl_net_ofi_mutex_unlock(&device->device_lock);
+			device->device_lock.unlock();
 
 			ep_for_addr = new_ep;
 
@@ -4483,17 +4443,11 @@ static nccl_net_ofi_rdma_recv_comm_t *prepare_recv_comm(nccl_net_ofi_rdma_domain
 	/* Allocate request freelist */
 	/* Maximum freelist entries is 4*NCCL_OFI_MAX_REQUESTS because each receive request
 	   can have associated reqs for send_ctrl, recv_segms, and eager_copy */
-	ret = nccl_ofi_freelist_init(sizeof(nccl_net_ofi_rdma_req_t), 16, 16,
-				     4 * NCCL_OFI_MAX_REQUESTS,
-				     rdma_fl_req_entry_init, rdma_fl_req_entry_fini,
-				     "Recv Communicator Requests",
-				     true,
-				     &r_comm->nccl_ofi_reqs_fl);
-	if (OFI_UNLIKELY(ret != 0)) {
-		NCCL_OFI_WARN("Could not allocate NCCL OFI requests free list for dev %d",
-				  dev_id);
-		goto error;
-	}
+	r_comm->nccl_ofi_reqs_fl = new nccl_ofi_freelist(sizeof(nccl_net_ofi_rdma_req_t), 16, 16,
+							 4 * NCCL_OFI_MAX_REQUESTS,
+							 rdma_fl_req_entry_init, rdma_fl_req_entry_fini,
+							 "Recv Communicator Requests",
+							 true);
 
 	/* Allocate message buffer with initial sequence number NCCL_OFI_RDMA_MSG_SEQ_NUM_START */
 	r_comm->msgbuff = nccl_ofi_msgbuff_init(NCCL_OFI_RDMA_MSGBUFF_SIZE, NCCL_OFI_RDMA_SEQ_BITS,
@@ -4504,30 +4458,20 @@ static nccl_net_ofi_rdma_recv_comm_t *prepare_recv_comm(nccl_net_ofi_rdma_domain
 		return NULL;
 	}
 
-	ret = nccl_ofi_freelist_init_mr(sizeof(nccl_net_ofi_rdma_close_msg_t),
-					8, 8, NCCL_OFI_MAX_REQUESTS, NULL, NULL,
-					freelist_regmr_host_fn,
-					freelist_deregmr_host_fn, domain, 1,
-					"Ctrl Buffer",
-					true,
-					&r_comm->ctrl_buff_fl);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Call to freelist_init_mr failed: %d", ret);
-		return NULL;
-	}
+	r_comm->ctrl_buff_fl = new nccl_ofi_freelist(sizeof(nccl_net_ofi_rdma_close_msg_t),
+						     8, 8, NCCL_OFI_MAX_REQUESTS, NULL, NULL,
+						     freelist_regmr_host_fn,
+						     freelist_deregmr_host_fn, domain, 1,
+						     "Ctrl Buffer",
+						     true);
 
 	/* Allocate flush buffer freelist */
-	ret = nccl_ofi_freelist_init_mr(NCCL_OFI_DEFAULT_CPU_CACHE_LINE_SIZE * MAX_NUM_RAILS,
-					8, 8, NCCL_OFI_MAX_REQUESTS, NULL, NULL,
-					freelist_regmr_host_fn,
-					freelist_deregmr_host_fn, domain, NCCL_OFI_DEFAULT_CPU_CACHE_LINE_SIZE,
-					"Flush Buffer",
-					true,
-					&r_comm->flush_buff_fl);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Call to freelist_init_mr failed for flush buffer: %d", ret);
-		return NULL;
-	}
+	r_comm->flush_buff_fl = new nccl_ofi_freelist(NCCL_OFI_DEFAULT_CPU_CACHE_LINE_SIZE * MAX_NUM_RAILS,
+						      8, 8, NCCL_OFI_MAX_REQUESTS, NULL, NULL,
+						      freelist_regmr_host_fn,
+						      freelist_deregmr_host_fn, domain,
+						      NCCL_OFI_DEFAULT_CPU_CACHE_LINE_SIZE,
+						      "Flush Buffer", true);
 
 #if HAVE_NVTX_TRACING
 	if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
@@ -4549,7 +4493,7 @@ static nccl_net_ofi_rdma_recv_comm_t *prepare_recv_comm(nccl_net_ofi_rdma_domain
 		/* TODO: free endpoint-per-comm ep if we created one above
 		   This should all really just be "recv_comm_destroy()" */
 		if (r_comm->nccl_ofi_reqs_fl)
-			nccl_ofi_freelist_fini(r_comm->nccl_ofi_reqs_fl);
+			delete r_comm->nccl_ofi_reqs_fl;
 		if (r_comm->msgbuff)
 			nccl_ofi_msgbuff_destroy(r_comm->msgbuff);
 		if (COMM_ID_INVALID != r_comm->local_comm_id) {
@@ -4696,9 +4640,9 @@ static int accept_wait_for_connection(nccl_net_ofi_rdma_domain_t *domain,
 	 * called.
 	 */
 
-	nccl_net_ofi_mutex_lock(&domain->domain_lock);
+	domain->domain_lock.lock();
 	ep->increment_ref_cnt();
-	nccl_net_ofi_mutex_unlock(&domain->domain_lock);
+	domain->domain_lock.unlock();
 
 	/* Initialize connect response message */
 	nccl_ofi_rdma_connection_info_t conn_resp_msg;
@@ -4743,7 +4687,7 @@ static int accept(nccl_net_ofi_listen_comm_t *listen_comm,
 	nccl_net_ofi_rdma_domain_t *domain = l_comm_ep->rdma_endpoint_get_domain();
 	assert(domain != NULL);
 
-	pthread_wrapper eplock(ENDPOINT_LOCK(ep));
+	std::lock_guard eplock(ENDPOINT_LOCK(ep));
 
 	CHECK_ENDPOINT_ACTIVE(ep, "accept");
 
@@ -4844,7 +4788,6 @@ static int accept(nccl_net_ofi_listen_comm_t *listen_comm,
 	 * close_listen_recv_comm will take the ep lock in case of an error,
 	 * so unlock it here .
 	 */
-	eplock.unlock();
 	int close_ret = close_listen_recv_comm(l_comm);
 	if (close_ret) {
 		NCCL_OFI_WARN("Failed to close listen communicator");
@@ -4895,7 +4838,7 @@ int nccl_net_ofi_rdma_ep_t::listen(nccl_net_ofi_conn_handle_t *handle,
 
 	int dev_id = device->dev_id;
 
-	pthread_wrapper lock(&this->ep_lock);
+	std::lock_guard lock(this->ep_lock);
 
 	CHECK_ENDPOINT_ACTIVE(this, "listen");
 
@@ -5139,7 +5082,7 @@ static int post_rx_buffer(nccl_net_ofi_rdma_req_t *req,
 			      bool set_fi_more)
 {
 	rdma_req_rx_buff_data_t *rx_buff_data = get_rx_buff_data(req);
-	nccl_ofi_freelist_elem_t *rx_buff_fl_elem = rx_buff_data->rx_buff_fl_elem;
+	nccl_ofi_freelist::fl_entry *rx_buff_fl_elem = rx_buff_data->rx_buff_fl_elem;
 	freelist_regmr_fn_handle_t *fl_mr_handle =
 		(freelist_regmr_fn_handle_t *)rx_buff_fl_elem->mr_handle;
 	void *desc = fi_mr_desc(fl_mr_handle->mr_handle->mr[rx_buff_data->rail->rail_id].get());
@@ -5157,9 +5100,9 @@ static int post_rx_buffer(nccl_net_ofi_rdma_req_t *req,
 	nccl_net_ofi_rdma_ep_t *ep = rx_buff_data->ep;
 	assert(req->type != NCCL_OFI_RDMA_EAGER_RX_BUFF || ep->eager_rx_buff_size > 0);
 
-	nccl_ofi_freelist_t *fl = (req->type == NCCL_OFI_RDMA_EAGER_RX_BUFF ?
+	nccl_ofi_freelist *fl = (req->type == NCCL_OFI_RDMA_EAGER_RX_BUFF ?
 		ep->eager_rx_buff_fl : ep->ctrl_rx_buff_fl);
-	nccl_ofi_freelist_entry_set_undefined(fl, rx_buff_fl_elem->ptr);
+	fl->entry_set_undefined(rx_buff_fl_elem->ptr);
 
 	iov.iov_base = rx_buff_fl_elem->ptr;
 	iov.iov_len = rx_buff_data->buff_len;
@@ -5259,7 +5202,7 @@ static int send_progress(nccl_net_ofi_rdma_req_t *req)
 }
 
 static ssize_t send_ctrl_post(nccl_net_ofi_rdma_recv_comm_t *r_comm,
-			  nccl_ofi_freelist_elem_t *ctrl_fl_elem,
+			  nccl_ofi_freelist::fl_entry *ctrl_fl_elem,
 			  uint16_t rail_id,
 			  size_t size,
 			  nccl_net_ofi_rdma_req_t *req)
@@ -5352,7 +5295,7 @@ static int post_close_msg(nccl_net_ofi_rdma_req_t *req)
 	/* Always use control rail 0 for close message */
 	rail_id = 0;
 
-	nccl_ofi_freelist_elem_t *ctrl_fl_elem = send_close_data->ctrl_fl_elem;
+	nccl_ofi_freelist::fl_entry *ctrl_fl_elem = send_close_data->ctrl_fl_elem;
 
 	req->state = NCCL_OFI_RDMA_REQ_PENDING;
 
@@ -5597,7 +5540,7 @@ static int send(nccl_net_ofi_send_comm_t *send_comm, void *data, size_t size, in
 	domain = ep->rdma_endpoint_get_domain();
 	assert(domain != NULL);
 
-	pthread_wrapper eplock(ENDPOINT_LOCK(ep));
+	std::lock_guard eplock(ENDPOINT_LOCK(ep));
 
 	CHECK_ENDPOINT_ACTIVE(ep, "send");
 
@@ -5646,7 +5589,7 @@ static int send(nccl_net_ofi_send_comm_t *send_comm, void *data, size_t size, in
 	} else {
 		/* Memory synchronization point to ensure that the data in the control msg is not
 		 * read before the sequence number is checked */
-		__sync_synchronize();
+		std::atomic_thread_fence(std::memory_order_acquire);
 		s_comm->n_ctrl_received += 1;
 	}
 
@@ -5859,47 +5802,28 @@ int nccl_net_ofi_rdma_ep_t::init_rx_buffers()
 	const bool enable_freelist_leak_detection = false;
 
 	/* We maintain this for only connection close messages */
-	ret = nccl_ofi_freelist_init(sizeof(nccl_net_ofi_rdma_req_t),
-				     ofi_nccl_rdma_min_posted_control_buffers(), 16, 0,
-				     rdma_fl_req_entry_init, rdma_fl_req_entry_fini,
-				     "Rx Buffer Requests",
-				     enable_freelist_leak_detection,
-				     &this->rx_buff_reqs_fl);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Failed to init rx_buff_reqs_fl");
-		return ret;
-	}
+	this->rx_buff_reqs_fl = new nccl_ofi_freelist(sizeof(nccl_net_ofi_rdma_req_t),
+						      ofi_nccl_rdma_min_posted_control_buffers(), 16, 0,
+						      rdma_fl_req_entry_init, rdma_fl_req_entry_fini,
+						      "Rx Buffer Requests",
+						      enable_freelist_leak_detection);
 
-	ret = nccl_ofi_freelist_init_mr(this->ctrl_rx_buff_size,
-					ofi_nccl_rdma_min_posted_control_buffers(), 16, 0,
-					NULL, NULL,
-					freelist_regmr_host_fn, freelist_deregmr_host_fn,
-					domain_ptr, 1,
-					"Ctrl Rx Buffer",
-					enable_freelist_leak_detection,
-					&this->ctrl_rx_buff_fl);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Failed to init ctrl_rx_buff_fl");
-		if (nccl_ofi_freelist_fini(this->rx_buff_reqs_fl))
-			NCCL_OFI_WARN("Also failed to freelist_fini rx_buff_reqs_fl");
-		return ret;
-	}
+	this->ctrl_rx_buff_fl = new nccl_ofi_freelist(this->ctrl_rx_buff_size,
+						      ofi_nccl_rdma_min_posted_control_buffers(), 16, 0,
+						      NULL, NULL,
+						      freelist_regmr_host_fn, freelist_deregmr_host_fn,
+						      domain_ptr, 1,
+						      "Ctrl Rx Buffer",
+						      enable_freelist_leak_detection);
 
 	if (this->eager_rx_buff_size > 0) {
-		ret = nccl_ofi_freelist_init_mr(this->eager_rx_buff_size,
-						ofi_nccl_rdma_min_posted_eager_buffers(), 16, 0,
-						NULL, NULL,
-						freelist_regmr_host_fn, freelist_deregmr_host_fn,
-						domain_ptr, EAGER_RX_BUFFER_ALIGNMENT,
-						"Eager Rx Buffer",
-						enable_freelist_leak_detection,
-						&this->eager_rx_buff_fl);
-		if (ret != 0) {
-			NCCL_OFI_WARN("Failed to init eager_rx_buff_size");
-			nccl_ofi_freelist_fini(this->ctrl_rx_buff_fl);
-			nccl_ofi_freelist_fini(this->rx_buff_reqs_fl);
-			return ret;
-		}
+		this->eager_rx_buff_fl = new nccl_ofi_freelist(this->eager_rx_buff_size,
+							       ofi_nccl_rdma_min_posted_eager_buffers(), 16, 0,
+							       NULL, NULL,
+							       freelist_regmr_host_fn, freelist_deregmr_host_fn,
+							       domain_ptr, EAGER_RX_BUFFER_ALIGNMENT,
+							       "Eager Rx Buffer",
+							       enable_freelist_leak_detection);
 	} else {
 		this->eager_rx_buff_fl = NULL;
 	}
@@ -5950,25 +5874,13 @@ int nccl_net_ofi_rdma_ep_t::fini_rx_buffers()
 	int ret = 0;
 	nccl_net_ofi_rdma_ep_rail_t *rail;
 
-	ret = nccl_ofi_freelist_fini(this->ctrl_rx_buff_fl);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Failed to fini ctrl_rx_buff_fl");
-		return ret;
-	}
+	delete this->ctrl_rx_buff_fl;
 
 	if (this->eager_rx_buff_fl != NULL) {
-		ret = nccl_ofi_freelist_fini(this->eager_rx_buff_fl);
-		if (ret != 0) {
-			NCCL_OFI_WARN("Failed to fini eager_rx_buff_fl");
-			return ret;
-		}
+		delete this->eager_rx_buff_fl;
 	}
 
-	ret = nccl_ofi_freelist_fini(this->rx_buff_reqs_fl);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Failed to fini rx_buff_reqs_fl");
-		return ret;
-	}
+	delete this->rx_buff_reqs_fl;
 
 	for (uint16_t rail_id = 0; rail_id < this->num_rails; ++rail_id) {
 		rail = this->rdma_endpoint_get_rail(rail_id);
@@ -6108,7 +6020,6 @@ int nccl_net_ofi_rdma_ep_t::create_send_comm(nccl_net_ofi_rdma_send_comm_t **s_c
 	int ret = 0;
 	size_t comm_id = 0;
 	nccl_net_ofi_rdma_send_comm_t *ret_s_comm = NULL;
-	uint16_t rail_id = 0;
 
 	*s_comm = NULL;
 
@@ -6156,9 +6067,9 @@ int nccl_net_ofi_rdma_ep_t::create_send_comm(nccl_net_ofi_rdma_send_comm_t **s_c
 	   get_ep(). Increase the refcnt so the endpoint is not freed when the
 	   API releases it.*/
 
-	nccl_net_ofi_mutex_lock(&domain_ptr->domain_lock);
+	domain_ptr->domain_lock.lock();
 	this->increment_ref_cnt();
-	nccl_net_ofi_mutex_unlock(&domain_ptr->domain_lock);
+	domain_ptr->domain_lock.unlock();
 
 	/* Allocate send communicator ID */
 	comm_id = device->comm_idpool.allocate_id();
@@ -6177,17 +6088,11 @@ int nccl_net_ofi_rdma_ep_t::create_send_comm(nccl_net_ofi_rdma_send_comm_t **s_c
 	ret_s_comm->num_control_rails = num_control_rails;
 
 	/* Allocate request free list */
-	ret = nccl_ofi_freelist_init(sizeof(nccl_net_ofi_rdma_req_t), 16, 16,
-				     NCCL_OFI_MAX_SEND_REQUESTS,
-				     rdma_fl_req_entry_init, rdma_fl_req_entry_fini,
-				     "Send Communicator Requests",
-				     true,
-				     &ret_s_comm->nccl_ofi_reqs_fl);
-	if (OFI_UNLIKELY(ret != 0)) {
-		NCCL_OFI_WARN("Could not allocate NCCL OFI request free list for dev %d rail %d",
-			      dev_id, rail_id);
-		goto error;
-	}
+	ret_s_comm->nccl_ofi_reqs_fl = new nccl_ofi_freelist(sizeof(nccl_net_ofi_rdma_req_t), 16, 16,
+							     NCCL_OFI_MAX_SEND_REQUESTS,
+							     rdma_fl_req_entry_init, rdma_fl_req_entry_fini,
+							     "Send Communicator Requests",
+							     true);
 
 	/* Allocate control mailbox */
 	ret = domain_ptr->reg_internal_mr(ret_s_comm->ctrl_mailbox, sizeof(nccl_net_ofi_ctrl_msg_t) * NCCL_OFI_CTRL_MAILBOX_SIZE,
@@ -6219,9 +6124,9 @@ int nccl_net_ofi_rdma_ep_t::create_send_comm(nccl_net_ofi_rdma_send_comm_t **s_c
 			device->comm_idpool.free_id(ret_s_comm->local_comm_id);
 		}
 
-		nccl_net_ofi_mutex_lock(&domain_ptr->domain_lock);
+		domain_ptr->domain_lock.lock();
 		this->decrement_ref_cnt();
-		nccl_net_ofi_mutex_unlock(&domain_ptr->domain_lock);
+		domain_ptr->domain_lock.unlock();
 		free_rdma_send_comm(ret_s_comm);
 	}
 
@@ -6242,7 +6147,7 @@ int nccl_net_ofi_rdma_ep_t::connect(nccl_net_ofi_conn_handle_t *handle,
 	nccl_net_ofi_rdma_send_comm_t *s_comm =
 		reinterpret_cast<nccl_net_ofi_rdma_send_comm_t *>(comm_state->comm);
 
-	pthread_wrapper lock(&this->ep_lock);
+	std::lock_guard lock(this->ep_lock);
 
 	CHECK_ENDPOINT_ACTIVE(this, "connect");
 
@@ -6318,7 +6223,6 @@ int nccl_net_ofi_rdma_ep_t::connect(nccl_net_ofi_conn_handle_t *handle,
 	return ret;
 
 error:
-	lock.unlock();
 	if (s_comm) {
 		send_comm_destroy(s_comm);
 		s_comm = nullptr;
@@ -6553,7 +6457,7 @@ int nccl_net_ofi_rdma_ep_t::release_ep(bool skip_lock, bool force_cleanup)
 		}
 
 		if (!skip_lock) {
-			nccl_net_ofi_mutex_lock(&domain_ptr->domain_lock);
+			domain_ptr->domain_lock.lock();
 		}
 
 		this->decrement_ref_cnt();
@@ -6574,7 +6478,7 @@ int nccl_net_ofi_rdma_ep_t::release_ep(bool skip_lock, bool force_cleanup)
 			ret = this->cleanup_resources();
 
 			if (!skip_lock) {
-				nccl_net_ofi_mutex_unlock(&domain_ptr->domain_lock);
+				domain_ptr->domain_lock.unlock();
 			}
 
 			this->parent_endpoint->release_ep(skip_lock, force_cleanup);
@@ -6591,7 +6495,7 @@ int nccl_net_ofi_rdma_ep_t::release_ep(bool skip_lock, bool force_cleanup)
 
  unlock:
 		if (!skip_lock) {
-			nccl_net_ofi_mutex_unlock(&domain_ptr->domain_lock);
+			domain_ptr->domain_lock.lock();
 		}
 		if (!force_cleanup && ret == 0 && local_ref_cnt == 0) {
 			/* Release the domain as well */

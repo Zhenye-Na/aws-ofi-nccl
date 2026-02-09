@@ -7,6 +7,7 @@
 #include "gin/nccl_ofi_gin.h"
 #include "gin/nccl_ofi_gin_reqs.h"
 #include "gin/nccl_ofi_gin_resources.h"
+#include "nccl_ofi_tracepoint.h"
 
 int nccl_net_ofi_gin_op_req_t::op_req_ctx::handle_cq_entry(struct fi_cq_entry *cq_entry_base,
 							   fi_addr_t src_addr, uint16_t rail_id)
@@ -56,7 +57,7 @@ nccl_net_ofi_gin_recv_req_t::nccl_net_ofi_gin_recv_req_t(nccl_ofi_gin_resources 
 							 nccl_ofi_gin_ep_rail_t &rail_arg)
     : nccl_net_ofi_gin_op_req_t(), resources(resources_arg), rail(rail_arg)
 {
-	rx_buff_elem = nccl_ofi_freelist_entry_alloc(resources.get_rx_buff_fl());
+	rx_buff_elem = resources.get_rx_buff_fl()->entry_alloc();
 	if (!rx_buff_elem) {
 		NCCL_OFI_WARN("Failed to allocate rx buffer freelist entry");
 		throw std::runtime_error("Failed to allocate rx buffer freelist entry");
@@ -65,7 +66,7 @@ nccl_net_ofi_gin_recv_req_t::nccl_net_ofi_gin_recv_req_t(nccl_ofi_gin_resources 
 
 nccl_net_ofi_gin_recv_req_t::~nccl_net_ofi_gin_recv_req_t()
 {
-	nccl_ofi_freelist_entry_free(resources.get_rx_buff_fl(), rx_buff_elem);
+	resources.get_rx_buff_fl()->entry_free(rx_buff_elem);
 }
 
 int nccl_net_ofi_gin_recv_req_t::handle_cq_entry(struct fi_cq_entry *cq_entry_base,
@@ -171,6 +172,9 @@ int nccl_net_ofi_gin_iputsignal_req_t::test(int *done)
 {
 	*done = 0;
 
+	auto &gin_ep = gin_comm.get_resources().get_ep();
+	std::lock_guard scoped_ep_lock(gin_ep.ep_lock);
+
 	bool all_writes_done = true;
 	for (auto &write_req : write_reqs) {
 		if (write_req) {
@@ -209,6 +213,8 @@ int nccl_net_ofi_gin_iputsignal_req_t::test(int *done)
 	if (*done) {
 		NCCL_OFI_TRACE(NCCL_NET, "Completed iputSignal seq num %hu on initiator",
 			       this->msg_seq_num);
+		NCCL_OFI_TRACE_GIN_IPUT_SIGNAL_END(gin_comm.get_dev(), &gin_comm, peer_rank,
+						   msg_seq_num, this);
 		gin_comm.get_resources().return_req_to_pool(this);
 	}
 
@@ -251,5 +257,5 @@ int nccl_net_ofi_gin_metadata_send_req_t::post()
 
 nccl_net_ofi_gin_metadata_send_req_t::~nccl_net_ofi_gin_metadata_send_req_t()
 {
-	nccl_ofi_freelist_entry_free(metadata_fl, metadata_elem);
+	metadata_fl->entry_free(metadata_elem);
 }

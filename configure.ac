@@ -1,12 +1,17 @@
 # -*- Autoconf -*-
 #
-# Copyright (c) 2018-2023, Amazon.com, Inc. or its affiliates. All rights reserved.
+# Copyright (c) 2018-2026, Amazon.com, Inc. or its affiliates. All rights reserved.
 #
 # See LICENSE.txt for license information
 #
 
+define([fatal_esyscmd], [esyscmd( $1 )dnl
+ifelse(sysval,[0],[],[m4_fatal(error: $1 failed (sysval))])])dnl
+
 # Initialization
-AC_INIT([aws-ofi-nccl], [GitHub-dev], [al-ofi-nccl-team@amazon.com], , [http://github.com/aws/aws-ofi-nccl])
+AC_INIT([aws-ofi-nccl],
+	[m4_normalize(fatal_esyscmd([m4/get_version.sh]))],
+        [al-ofi-nccl-team@amazon.com], , [http://github.com/aws/aws-ofi-nccl])
 AC_PREREQ([2.69])
 AC_CONFIG_SRCDIR([src/nccl_ofi_net.cpp])
 AC_CONFIG_AUX_DIR([build-aux])
@@ -46,6 +51,8 @@ AC_LANG([C++])
 dnl use C++17, disable runtime type information
 AX_CXX_COMPILE_STDCXX([17], [noext], [mandatory])
 CXXFLAGS="${CXXFLAGS} -fno-rtti"
+
+AX_COMPILER_VENDOR
 
 dnl AM_PROG_AR must be called before LT_INIT
 AM_PROG_AR
@@ -271,6 +278,11 @@ AS_IF([test "${enable_picky_compiler}" != "no"], [
     dnl ADD_PICKY_FLAGS([-fanalyzer])
 
     dnl todo: clang-sa flags
+
+    AS_IF([test "$ax_cv_cxx_compiler_vendor" = "clang"],
+          [dnl Squash Clang warnings about variable length array extensions, because
+           dnl not having them is sadness.
+	   ADD_PICKY_FLAGS([-Wno-vla-cxx-extension])])
 
     AC_MSG_NOTICE([Adding ${picky_cxxflags} to CXXFLAGS.])
     CXXFLAGS="${CXXFLAGS} ${picky_cxxflags}"

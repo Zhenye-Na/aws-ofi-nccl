@@ -11,31 +11,16 @@
 
 #include "nccl_ofi.h"
 #include "nccl_ofi_gdrcopy.h"
+#include "nccl_ofi_tracepoint.h"
 
 /**
- * Context that is shared across all GIN communicators and created during GIN
- * init. It is used to store the GDRCopy device copy context.
+ * Get singleton instance of the device copy context shared across all GIN communicators.
  */
-class nccl_ofi_gin_ctx {
-public:
-	/**
-	 * Create a GIN context. This will create a new instance of the GDRCopy
-	 * device copy context
-	 *
-	 * @throw runtime_error if GDRCopy cannot be loaded
-	 */
-	nccl_ofi_gin_ctx();
-
-	~nccl_ofi_gin_ctx();
-
-	nccl_ofi_device_copy &get_device_copy_ctx()
-	{
-		return *copy_ctx;
-	}
-
-private:
-	nccl_ofi_device_copy *copy_ctx;
-};
+inline nccl_ofi_device_copy &get_device_copy()
+{
+	static nccl_ofi_gdrcopy_ctx instance;
+	return instance;
+}
 
 /**
  * The listen communicator which implements GIN API's nccl_ofi_gin_listen() and
@@ -43,14 +28,13 @@ private:
  */
 class nccl_ofi_gin_listen_comm {
 private:
-	int dev;
 	nccl_net_ofi_ep_t *ep;
 	nccl_net_ofi_listen_comm_t *l_comm;
 
 public:
 	nccl_ofi_gin_listen_comm(int dev_arg, nccl_net_ofi_ep_t *ep_arg,
 				 nccl_net_ofi_listen_comm_t *l_comm_arg)
-	    : dev(dev_arg), ep(ep_arg), l_comm(l_comm_arg)
+	    : ep(ep_arg), l_comm(l_comm_arg)
 	{
 	}
 
@@ -62,8 +46,8 @@ public:
 		}
 	}
 
-	int connect(nccl_ofi_gin_ctx *gin_ctx, nccl_net_ofi_conn_handle_t *handles[], int nranks,
-		    int rank, nccl_ofi_gin_comm **gin_comm_out);
+	int connect(nccl_net_ofi_conn_handle_t *handles[], int nranks, int rank,
+		    nccl_ofi_gin_comm **gin_comm_out);
 };
 
 /**
@@ -167,12 +151,23 @@ struct gin_sym_mr_handle {
 class nccl_ofi_gin_comm {
 public:
 	nccl_ofi_gin_comm(nccl_ofi_gin_resources &resources_arg, int rank_, int nranks_,
-			  nccl_net_ofi_send_comm_t *s_comm_, nccl_net_ofi_recv_comm_t *r_comm_,
-			  nccl_ofi_device_copy &copy_ctx_);
+			  nccl_net_ofi_send_comm_t *s_comm_, nccl_net_ofi_recv_comm_t *r_comm_);
+
+	~nccl_ofi_gin_comm();
 
 	nccl_ofi_gin_resources &get_resources()
 	{
 		return resources;
+	}
+
+	int get_rank() const
+	{
+		return rank;
+	}
+
+	int get_dev() const
+	{
+		return dev;
 	}
 
 	/**
@@ -271,6 +266,7 @@ private:
 
 	int rank;
 	int nranks;
+	int dev;
 
 	/* AllGather ring for metadata exchange */
 	nccl_ofi_gin_allgather_comm ag_comm;
@@ -296,9 +292,6 @@ private:
 	   lookup. Not sure yet if that is the right thing to do. */
 	std::unordered_map<void *, gin_sym_mr_handle *> mr_handle_map;
 
-	/* Reference to the context's copy context (created during initialization) */
-	nccl_ofi_device_copy &copy_ctx;
-
 	/* Number of outstanding RDMA writes for signal delivery acknowledgement
 	   Used to wait for remaining acknowledgements on communicator close. */
 	size_t outstanding_ack_counter = 0;
@@ -316,7 +309,7 @@ private:
 	 * nccl_net_ofi_gin_signal_metadata_msg_t). An entry is allocated from
 	 * this freelist for each putSignal operation.
 	 */
-	std::unique_ptr<nccl_ofi_freelist_t, decltype(&freelist_deleter)> metadata_fl;
+	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> metadata_fl;
 
 	int do_gin_signal(const nccl_net_ofi_gin_signal_metadata_msg_t &metadata);
 
@@ -326,6 +319,12 @@ private:
 	int iput_signal_deliver_all(uint32_t peer_rank);
 
 	friend class nccl_ofi_gin_listen_comm;
+
+public:
+	/* NVTX tracing support - public for macro access (parallel to RDMA struct pattern) */
+#if HAVE_NVTX_TRACING
+	nvtxDomainHandle_t nvtx_domain[NCCL_OFI_N_NVTX_DOMAIN_PER_COMM];
+#endif
 };
 
 #endif

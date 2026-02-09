@@ -71,7 +71,7 @@ typedef struct nccl_net_ofi_sendrecv_send_comm {
 	nccl_net_ofi_send_comm_t base;
 
 	uint64_t num_inflight_reqs;
-	nccl_ofi_freelist_t *nccl_ofi_reqs_fl;
+	nccl_ofi_freelist *nccl_ofi_reqs_fl;
 
 	uint64_t tag;
 	fi_addr_t remote_ep;
@@ -96,7 +96,7 @@ typedef struct nccl_net_ofi_sendrecv_recv_comm {
 	nccl_net_ofi_recv_comm_t base;
 
 	uint64_t num_inflight_reqs;
-	nccl_ofi_freelist_t *nccl_ofi_reqs_fl;
+	nccl_ofi_freelist *nccl_ofi_reqs_fl;
 
 	uint64_t tag;
 	fi_addr_t remote_ep;
@@ -122,9 +122,9 @@ public:
 	nccl_net_ofi_sendrecv_domain_t(nccl_net_ofi_sendrecv_device_t *device_arg,
 				       unsigned int domain_key = 0);
 	
-	inline ofi_domain_ptr &get_ofi_domain_for_cm() override
+	inline ofi_domain_ptr *get_ofi_domain_for_cm() override
 	{
-		return domain;
+		return &domain;
 	}
 
 	inline ofi_domain_ptr &get_ofi_domain(uint16_t rail_id = 0) override
@@ -401,7 +401,7 @@ typedef struct nccl_net_ofi_sendrecv_req {
 	nccl_net_ofi_sendrecv_req_direction_t direction;
 
 	/* Backpointer to freelist elem (for cleanup) */
-	nccl_ofi_freelist_elem_t *elem;
+	nccl_ofi_freelist::fl_entry *elem;
 } nccl_net_ofi_sendrecv_req_t;
 
 

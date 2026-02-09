@@ -10,6 +10,7 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <mutex>
 #include <stdexcept>
 #include <stdint.h>
 #include <stdio.h>
@@ -129,9 +130,6 @@ int nccl_net_ofi_sendrecv_device_t::get_properties(nccl_ofi_properties_t *props)
 static inline void sendrecv_req_update(nccl_net_ofi_sendrecv_req_t *req, nccl_net_ofi_sendrecv_req_state_t state, size_t size)
 {
 	req->size = size;
-	/* As nccl_net_ofi_test() can be called on other thread, state should
-	 * be updated last and there should be a barrier before state update */
-	__sync_synchronize();
 	req->state = state;
 }
 
@@ -361,13 +359,13 @@ static inline void sendrecv_req_zero(nccl_net_ofi_sendrecv_req_t *req)
  * @brief	Prepares sendrecv request for reuse
  */
 static inline int sendrecv_req_free(uint64_t *num_inflight_reqs,
-				    nccl_ofi_freelist_t *nccl_ofi_reqs_fl,
+				    nccl_ofi_freelist *nccl_ofi_reqs_fl,
 				    int dev_id,
 				    nccl_net_ofi_sendrecv_req_t *req,
 				    bool dec_inflight_reqs)
 {
 	int ret = 0;
-	nccl_ofi_freelist_elem_t *elem = NULL;
+	nccl_ofi_freelist::fl_entry *elem = NULL;
 
 	if (OFI_UNLIKELY(req == NULL)) {
 		ret = -EINVAL;
@@ -389,8 +387,7 @@ static inline int sendrecv_req_free(uint64_t *num_inflight_reqs,
 	sendrecv_req_zero(req);
 
 	assert(elem);
-	nccl_ofi_freelist_entry_free(nccl_ofi_reqs_fl, elem);
-
+	nccl_ofi_reqs_fl->entry_free(elem);
 	/* Reduce inflight commands */
 	if (OFI_LIKELY(dec_inflight_reqs == true))
 		(*num_inflight_reqs)--;
@@ -408,7 +405,7 @@ static inline int sendrecv_send_comm_free_req(nccl_net_ofi_sendrecv_send_comm_t 
 					      bool dec_inflight_reqs)
 {
 	uint64_t *num_inflight_reqs = &s_comm->num_inflight_reqs;
-	nccl_ofi_freelist_t *nccl_ofi_reqs_fl = s_comm->nccl_ofi_reqs_fl;
+	nccl_ofi_freelist *nccl_ofi_reqs_fl = s_comm->nccl_ofi_reqs_fl;
 	return sendrecv_req_free(num_inflight_reqs, nccl_ofi_reqs_fl, dev_id,
 				 req, dec_inflight_reqs);
 }
@@ -422,7 +419,7 @@ static inline int sendrecv_recv_comm_free_req(nccl_net_ofi_sendrecv_recv_comm_t 
 					      bool dec_inflight_reqs)
 {
 	uint64_t *num_inflight_reqs = &r_comm->num_inflight_reqs;
-	nccl_ofi_freelist_t *nccl_ofi_reqs_fl = r_comm->nccl_ofi_reqs_fl;
+	nccl_ofi_freelist *nccl_ofi_reqs_fl = r_comm->nccl_ofi_reqs_fl;
 	return sendrecv_req_free(num_inflight_reqs, nccl_ofi_reqs_fl, dev_id,
 				 req, dec_inflight_reqs);
 }
@@ -454,8 +451,6 @@ static inline int sendrecv_comm_free_req(nccl_net_ofi_comm_t *base_comm,
 	}
 }
 
-#define __compiler_barrier() do { asm volatile ("" : : : "memory"); } while(0)
-
 static int sendrecv_req_test(nccl_net_ofi_req_t *base_req, int *done, int *size)
 {
 	int ret = 0;
@@ -476,7 +471,7 @@ static int sendrecv_req_test(nccl_net_ofi_req_t *base_req, int *done, int *size)
 		return -EINVAL;
 	}
 
-	pthread_wrapper eplock(&ep->ep_lock);
+	std::lock_guard eplock(ep->ep_lock);
 
 	CHECK_ENDPOINT_ACTIVE(ep, "sendrecv_req_test");
 
@@ -490,7 +485,6 @@ static int sendrecv_req_test(nccl_net_ofi_req_t *base_req, int *done, int *size)
 	/* Determine whether the request has finished and free if done */
 	if (OFI_LIKELY(req->state == NCCL_OFI_SENDRECV_REQ_COMPLETED ||
 		       req->state == NCCL_OFI_SENDRECV_REQ_ERROR)) {
-		__compiler_barrier();
 		if (size)
 			*size = req->size;
 		/* Mark as done */
@@ -788,7 +782,7 @@ static int sendrecv_comm_mr_base_reg(nccl_net_ofi_comm_t *base_comm,
 	nccl_net_ofi_sendrecv_domain_t *domain = ep->sendrecv_endpoint_get_domain();
 	assert(domain != NULL);
 
-	pthread_wrapper domain_lock(&domain->domain_lock);
+	std::lock_guard domain_lock(domain->domain_lock);
 
 	int dev_id = device->dev_id;
 
@@ -881,17 +875,17 @@ static int sendrecv_recv_comm_dereg_mr(nccl_net_ofi_recv_comm_t *recv_comm,
 /*
  * @brief	Assign an allocated sendrecv request buffer
  */
-static inline nccl_net_ofi_sendrecv_req_t *sendrecv_allocate_req(nccl_ofi_freelist_t *fl)
+static inline nccl_net_ofi_sendrecv_req_t *sendrecv_allocate_req(nccl_ofi_freelist *fl)
 {
 	nccl_net_ofi_sendrecv_req_t *req = NULL;
-	nccl_ofi_freelist_elem_t *elem = NULL;
+	nccl_ofi_freelist::fl_entry *elem = NULL;
 
 	if (OFI_UNLIKELY(fl == NULL)) {
 		NCCL_OFI_WARN("Freelist not allocated");
 		goto exit;
 	}
 
-	elem = nccl_ofi_freelist_entry_alloc(fl);
+	elem = fl->entry_alloc();
 	if (OFI_UNLIKELY(elem == NULL)) {
 		NCCL_OFI_WARN("No freelist items available");
 		goto exit;
@@ -925,7 +919,7 @@ static int sendrecv_recv_comm_recv(nccl_net_ofi_recv_comm_t *recv_comm, int n, v
 		return -EINVAL;
 	}
 
-	pthread_wrapper eplock(&ep->ep_lock);
+	std::lock_guard eplock(ep->ep_lock);
 
 	CHECK_ENDPOINT_ACTIVE(ep, "recv");
 
@@ -1013,7 +1007,7 @@ static int sendrecv_recv_comm_recv(nccl_net_ofi_recv_comm_t *recv_comm, int n, v
 
 void nccl_net_ofi_sendrecv_ep_t::sendrecv_endpoint_abort()
 {
-	pthread_wrapper lock(&this->ep_lock);
+	std::lock_guard lock(this->ep_lock);
 
 	int dev_id = this->domain->get_device()->dev_id;
 
@@ -1062,7 +1056,7 @@ static int sendrecv_recv_comm_close(nccl_net_ofi_recv_comm_t *recv_comm)
 		r_comm->flush_buff.host_buffer = MAP_FAILED;
 	}
 
-	nccl_ofi_freelist_fini(r_comm->nccl_ofi_reqs_fl);
+	delete r_comm->nccl_ofi_reqs_fl;
 
 	if (r_comm->receiver) {
 		delete r_comm->receiver;
@@ -1095,7 +1089,7 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
 
 	auto *ep = reinterpret_cast<nccl_net_ofi_sendrecv_ep_t *>(r_comm->base.base.ep);
 
-	pthread_wrapper eplock(&ep->ep_lock);
+	std::lock_guard eplock(ep->ep_lock);
 
 	CHECK_ENDPOINT_ACTIVE(ep, "flush");
 
@@ -1360,18 +1354,10 @@ static nccl_net_ofi_sendrecv_recv_comm_t *sendrecv_recv_comm_prepare(nccl_net_of
 	r_comm->remote_ep = remote_ep;
 
 	/* Pre-allocated buffers for data path */
-
-	ret = nccl_ofi_freelist_init(req_size, 16, 16, NCCL_OFI_MAX_REQUESTS,
-				     sendrecv_fl_req_entry_init, NULL,
-				     "Sendrecv Recv Communicator Requests",
-				     true,
-				     &r_comm->nccl_ofi_reqs_fl);
-	if (OFI_UNLIKELY(ret != 0)) {
-		NCCL_OFI_WARN("Could not allocate NCCL OFI requests free list for dev %d",
-			      dev_id);
-		free(r_comm);
-		return NULL;
-	}
+	r_comm->nccl_ofi_reqs_fl = new nccl_ofi_freelist(req_size, 16, 16, NCCL_OFI_MAX_REQUESTS,
+							 sendrecv_fl_req_entry_init, NULL,
+							 "Sendrecv Recv Communicator Requests",
+							 true);
 
 	/*
 	 * Setup flush resources if using GPUDirect RDMA unless user disables
@@ -1445,7 +1431,7 @@ static int sendrecv_listen_comm_accept(nccl_net_ofi_listen_comm_t *listen_comm,
 	nccl_net_ofi_sendrecv_domain_t *domain = ep->sendrecv_endpoint_get_domain();
 	assert(domain != NULL);
 
-	pthread_wrapper eplock(&ep->ep_lock);
+	std::lock_guard eplock(ep->ep_lock);
 
 	CHECK_ENDPOINT_ACTIVE(ep, "accept");
 
@@ -1514,9 +1500,9 @@ static int sendrecv_listen_comm_accept(nccl_net_ofi_listen_comm_t *listen_comm,
 		 * refcnt and free it up when nccl_net_ofi_closeRecv is
 		 * called.
 		 */
-		nccl_net_ofi_mutex_lock(&domain->domain_lock);
+		domain->domain_lock.lock();
 		ep->increment_ref_cnt();
-		nccl_net_ofi_mutex_unlock(&domain->domain_lock);
+		domain->domain_lock.unlock();
 
 		comm_state->comm = &r_comm->base.base;
 
@@ -1643,7 +1629,7 @@ int nccl_net_ofi_sendrecv_ep_t::listen(nccl_net_ofi_conn_handle_t *handle,
 
 	nccl_net_ofi_sendrecv_domain_t *domain_ptr = this->sendrecv_endpoint_get_domain();
 
-	pthread_wrapper eplock(&this->ep_lock);
+	std::lock_guard eplock(this->ep_lock);
 
 	CHECK_ENDPOINT_ACTIVE(this, "listen");
 
@@ -1746,7 +1732,7 @@ static int sendrecv_send_comm_send(nccl_net_ofi_send_comm_t *send_comm, void *da
 		return -EINVAL;
 	}
 
-	pthread_wrapper eplock(&ep->ep_lock);
+	std::lock_guard eplock(ep->ep_lock);
 
 	CHECK_ENDPOINT_ACTIVE(ep, "send");
 
@@ -1841,7 +1827,7 @@ static int sendrecv_send_comm_close(nccl_net_ofi_send_comm_t *send_comm)
 		ep->sendrecv_endpoint_abort();
 	}
 
-	nccl_ofi_freelist_fini(s_comm->nccl_ofi_reqs_fl);
+	delete s_comm->nccl_ofi_reqs_fl;
 
 	if (s_comm->connector) {
 		delete s_comm->connector;
@@ -1915,9 +1901,9 @@ static inline int sendrecv_send_comm_create(nccl_net_ofi_conn_handle_t *handle,
 	   API releases it.
 	   Caller assumed to hold the domain lock. */
 
-	nccl_net_ofi_mutex_lock(&domain_ptr->domain_lock);
+	domain_ptr->domain_lock.lock();
 	ep->increment_ref_cnt();
-	nccl_net_ofi_mutex_unlock(&domain_ptr->domain_lock);
+	domain_ptr->domain_lock.unlock();
 
 	conn_info->ep_namelen = sizeof(conn_info->ep_name);
 
@@ -1935,59 +1921,23 @@ static inline int sendrecv_send_comm_create(nccl_net_ofi_conn_handle_t *handle,
 	}
 
 	/* Pre-allocated buffers for data path */
-	ret = nccl_ofi_freelist_init(req_size, 16, 16, NCCL_OFI_MAX_SEND_REQUESTS,
-				     sendrecv_fl_req_entry_init, NULL,
-				     "Sendrecv Send Communicator Requests",
-				     true,
-				     &ret_s_comm->nccl_ofi_reqs_fl);
-	if (OFI_UNLIKELY(ret != 0)) {
-		NCCL_OFI_WARN("Could not allocate NCCL OFI requests free list for dev %d",
-			      device->dev_id);
-		goto out;
-	}
+	ret_s_comm->nccl_ofi_reqs_fl = new nccl_ofi_freelist(req_size, 16, 16, NCCL_OFI_MAX_SEND_REQUESTS,
+							     sendrecv_fl_req_entry_init, NULL,
+							     "Sendrecv Send Communicator Requests",
+							     true);
 
 	*s_comm = ret_s_comm;
 out:
 	if (ret) {
 		/* Above code incremented the ep ref counter, so decrement it on
 		   failure */
-		nccl_net_ofi_mutex_lock(&domain_ptr->domain_lock);
+		domain_ptr->domain_lock.lock();
 		ep->decrement_ref_cnt();
-		nccl_net_ofi_mutex_unlock(&domain_ptr->domain_lock);
+		domain_ptr->domain_lock.unlock();
 		free(ret_s_comm);
 	}
 
 	return ret;
-}
-
-/*
- * @brief	Prepare a send request for a given s_comm
- *
- * @param	Valid send communicator object
- *
- * @return	NCCL OFI request, on success
- * 		NULL, others
- */
-static inline nccl_net_ofi_sendrecv_req_t *sendrecv_send_comm_prepare_send_req(nccl_net_ofi_sendrecv_send_comm_t *s_comm)
-{
-	nccl_net_ofi_sendrecv_req_t *req = NULL;
-
-	if (OFI_UNLIKELY(s_comm == NULL)) {
-		return NULL;
-	}
-
-	req = sendrecv_allocate_req(s_comm->nccl_ofi_reqs_fl);
-	if (OFI_UNLIKELY(req == NULL)) {
-		NCCL_OFI_WARN("Unable to get NCCL OFI request for device %d",
-			      s_comm->base.base.dev_id);
-		return NULL;
-	}
-
-	req->comm = &s_comm->base.base;
-	req->dev_id = s_comm->base.base.dev_id;
-	req->direction = NCCL_OFI_SENDRECV_SEND;
-
-	return req;
 }
 
 
@@ -2027,7 +1977,7 @@ int nccl_net_ofi_sendrecv_ep_t::connect(nccl_net_ofi_conn_handle_t *handle,
 	nccl_net_ofi_sendrecv_domain_t *domain_ptr = this->sendrecv_endpoint_get_domain();
 	assert(domain_ptr != nullptr);
 
-	pthread_wrapper eplock(&this->ep_lock);
+	std::lock_guard eplock(this->ep_lock);
 
 	CHECK_ENDPOINT_ACTIVE(this, "connect");
 

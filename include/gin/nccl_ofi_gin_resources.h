@@ -17,13 +17,9 @@
 #include "nccl_ofi_freelist.h"
 #include "nccl_ofi_scheduler.h"
 
-static inline void freelist_deleter(nccl_ofi_freelist_t *fl)
+static inline void freelist_deleter(nccl_ofi_freelist *fl)
 {
-	int ret = nccl_ofi_freelist_fini(fl);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Failed to finalize freelist");
-		assert(false);
-	}
+	delete fl;
 }
 
 /**
@@ -104,6 +100,8 @@ public:
 	 * should be done before memory can be deregistered.
 	 */
 	void close_ofi_eps();
+
+	std::mutex ep_lock;
 
 private:
 	nccl_net_ofi_domain_t &domain;
@@ -206,7 +204,7 @@ public:
 
 	/** Methods **/
 
-	nccl_ofi_freelist_t *get_rx_buff_fl()
+	nccl_ofi_freelist *get_rx_buff_fl()
 	{
 		return rx_buff_fl.get();
 	}
@@ -285,7 +283,7 @@ public:
 	{
 		static_assert(sizeof(T) <= sizeof(nccl_net_ofi_gin_union_req),
 			      "Request size too large for freelist");
-		auto freelist_elem = nccl_ofi_freelist_entry_alloc(req_fl.get());
+		auto freelist_elem = req_fl.get()->entry_alloc();
 		if (OFI_UNLIKELY(freelist_elem == nullptr)) {
 			throw std::runtime_error("Failed to allocate request from freelist");
 		}
@@ -295,7 +293,7 @@ public:
 		auto *req = static_cast<T *>(freelist_elem->ptr);
 
 		/* Keep a backpointer to freelist element to free */
-		req->fl_elem = freelist_elem;
+		req->set_fl_entry(freelist_elem);
 
 		return req;
 	}
@@ -303,14 +301,14 @@ public:
 	template <typename T> void return_req_to_pool(T *req)
 	{
 		/* Cache the fl_elem member since we will destruct the req. */
-		auto *fl_elem = req->fl_elem;
+		auto *fl_elem = req->get_fl_entry();
 
 		/* Run req's destructor */
 		req->~T();
 		req = nullptr;
 
 		/* Return to freelist */
-		nccl_ofi_freelist_entry_free(req_fl.get(), fl_elem);
+		req_fl.get()->entry_free(fl_elem);
 	}
 
 	/**
@@ -391,7 +389,7 @@ private:
 	uint16_t next_rail_id = 0;
 
 	/* Requests pool used by all comms of this resource */
-	std::unique_ptr<nccl_ofi_freelist_t, decltype(&freelist_deleter)> req_fl;
+	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> req_fl;
 
 	/**
 	 * Retry requests that were pending due to EAGAIN or lack of space in
@@ -400,7 +398,7 @@ private:
 	int retry_pending_reqs();
 
 	/* Pool of buffers for recv requests */
-	std::unique_ptr<nccl_ofi_freelist_t, decltype(&freelist_deleter)> rx_buff_fl;
+	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> rx_buff_fl;
 
 	/* Reqs for RX buffers */
 	std::vector<nccl_net_ofi_gin_recv_req_t> recv_reqs;
